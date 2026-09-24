@@ -425,7 +425,10 @@ def check_llms_txt(base: str) -> str:
     try:
         resp = HTTP.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
     except requests.RequestException as e:
-        return f"{url}: request failed ({type(e).__name__}: {e})"
+        return (
+            f"{url}: LOCAL CHECK FAILED ({type(e).__name__}: {e}). "
+            "Use web_fetch on this URL to determine whether llms.txt is present."
+        )
     ctype = resp.headers.get("Content-Type", "")
     if resp.status_code == 200 and "html" not in ctype:
         preview = resp.text.strip()[:800]
@@ -658,7 +661,7 @@ def layer3_organic_aeo(r: Researcher, ctx: AuditContext) -> str:
     faq_lines = "\n".join(
         f"- {s.label} ({s.requested_url}): "
         + (f"FAQ schema {'PRESENT' if s.has_faq_schema else 'absent'}; schema types: {', '.join(s.schema_types) or 'none'}"
-           if s.ok else f"not checked - {s.error}")
+           if s.ok else f"not checked locally ({s.error}) - use web_fetch on this URL and look for FAQPage JSON-LD")
         for s in ctx.pages.values()
     )
     return r.ask(
@@ -669,7 +672,8 @@ def layer3_organic_aeo(r: Researcher, ctx: AuditContext) -> str:
         "2. Analyze the AI answer-engine probe below: is the target company recommended? How is it "
         "described, and is that description accurate and favorable for this ICP? Which sources are "
         "cited, and does the target company own or appear in them?\n\n"
-        "3. Interpret the llms.txt and FAQ schema checks below (already performed programmatically).\n\n"
+        "3. Interpret the llms.txt and FAQ schema checks below (performed programmatically). Where a "
+        "check says it failed locally, verify it yourself with web_fetch before drawing a conclusion.\n\n"
         "End with a 3-bullet summary and ONE genuine strength.\n\n"
         f"## AI answer-engine probe\n{aeo}\n\n"
         f"## llms.txt check\n{ctx.llms_txt}\n\n"
