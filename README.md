@@ -93,11 +93,11 @@ buildCommand = "bash build.sh"
 startCommand = "gunicorn app:app"
 ```
 
-- **`build.sh`** installs `requirements.txt` and then runs `playwright install chromium` on every deploy. Railway needs that step to download the headless browser used for JavaScript-rendered pages; `pip install playwright` alone doesn't include it.
+- **`build.sh`** installs `requirements.txt` and then runs `playwright install --with-deps chromium` on every deploy. Railway needs that step to download the headless browser used for JavaScript-rendered pages; `pip install playwright` alone doesn't include it. `--with-deps` also installs the system libraries Chromium needs (via apt).
 - **`gunicorn.conf.py`** is read automatically by the plain `gunicorn app:app` start command. It sets one gthread worker with 16 threads and a 120s timeout. The app needs this because audits live in the worker's memory and the live progress page holds a long-lived SSE connection. gunicorn's defaults (one sync worker, 30s timeout) would block every other request while a stream is open, then kill the stream after 30 seconds.
 - **Port:** gunicorn picks up Railway's `PORT` automatically.
 - **Procfile:** the start command takes precedence over the `Procfile`, which is kept for other hosts.
-- **If Chromium can't start:** some images lack the system libraries Chromium needs. In that case, the audit logs "Headless browser fallback unavailable" and carries on without it. Changing the last line of `build.sh` to `playwright install --with-deps chromium` installs those libraries on Debian/Ubuntu-based images.
+- **If the build fails at the Playwright step:** `--with-deps` uses `apt-get`, which only works on Debian/Ubuntu-based build images. If your image can't run it, change the last line of `build.sh` back to `playwright install chromium`. The audit still runs if Chromium then can't start; it logs "Headless browser fallback unavailable" and continues without the browser.
 
 1. Create a Railway project from this GitHub repo.
 2. Under **Variables**, add `ANTHROPIC_API_KEY` and `APP_PASSWORD`. You can also add `CLAUDE_MODEL` to change the model from the default `claude-opus-5`. Railway sets `PORT` itself.
