@@ -16,8 +16,10 @@ The audit runs five layers:
 
 How it works:
     * Pages are fetched locally with `requests` and parsed with BeautifulSoup into a compact
-      "snapshot" (title, headings, CTAs, forms, schema markup, visible text). Fetch failures are
-      recorded and the audit continues.
+      "snapshot" (title, headings, CTAs, forms, schema markup, visible text). Thin (<500 words) or
+      bot-blocked pages are re-rendered in headless Chromium via Playwright; content that only
+      appears after JavaScript runs is flagged as a CRO (Layer 1) and SEO/AEO (Layer 3) finding.
+      Fetch failures are recorded and the audit continues.
     * Each layer is one Claude API call with the server-side web_search and web_fetch tools
       enabled, so Claude can research beyond the local snapshots (and retry pages the local
       fetch could not reach).
@@ -66,6 +68,20 @@ MAX_CONTINUATIONS = 5
 
 HTTP_TIMEOUT = 15  # seconds per local page fetch
 PAGE_TEXT_CHARS = 6000  # visible-text excerpt kept per page snapshot
+
+# JavaScript-rendered pages: when the raw HTML has fewer words than this, the page is re-fetched in
+# a headless browser (Playwright + Chromium). Same when a plain request is blocked with one of the
+# status codes below, since bot protection often lets a real browser through.
+JS_RENDER_MIN_WORDS = 500
+BROWSER_RETRY_STATUSES = {401, 403, 429, 503}
+BROWSER_TIMEOUT_MS = 30_000
+
+# Price-like tokens ("$349", "0.35%", "per month", "/mo") - used to spot pricing that only exists
+# after JavaScript runs.
+PRICE_PATTERN = re.compile(
+    r"[$€£]\s?\d[\d,.]*[kKmM]?\b|\b\d+(?:\.\d+)?\s?%|\bper (?:month|transaction|user|seat|year)\b|/mo(?:nth)?\b",
+    re.IGNORECASE,
+)
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 growth-audit/1.0"
@@ -259,7 +275,28 @@ class PageSnapshot:
     has_faq_schema: bool = False
     word_count: int = 0
     text_excerpt: str = ""
+    text: str = field(default="", repr=False)  # full visible text (not sent to Claude)
     links: list[tuple[str, str]] = field(default_factory=list)  # (anchor text, absolute href)
+    # How the page was fetched: "standard" (plain HTTP) or "playwright" (headless browser).
+    fetch_method: str = "standard"
+    raw_word_count: int | None = None  # words in the raw HTML, when the browser version was used
+    js_missing: list[tuple[str, str]] = field(default_factory=list)  # (short, detailed) content only JS shows
+    render_note: str = ""  # what happened with the browser fallback, if it ran
+
+    @property
+    def js_rendered(self) -> bool:
+        """True when key content only appeared after JavaScript ran in a headless browser."""
+        return bool(self.js_missing)
+
+    def method_summary(self) -> str:
+        if self.fetch_method == "playwright":
+            if self.raw_word_count is not None:
+                return (
+                    f"headless browser (Playwright) - raw HTML had {self.raw_word_count:,} words, "
+                    f"rendered page {self.word_count:,}"
+                )
+            return f"headless browser (Playwright) - {self.render_note or 'plain request was blocked'}"
+        return "standard HTTP" + (f" ({self.render_note})" if self.render_note else "")
 
     def to_prompt(self) -> str:
         """Render the snapshot as markdown for inclusion in a prompt."""
@@ -268,11 +305,13 @@ class PageSnapshot:
                 f"### {self.label}\n"
                 f"- URL: {self.requested_url}\n"
                 f"- LOCAL FETCH FAILED: {self.error}\n"
-                f"- Try web_fetch on this URL; if that also fails, record the page as unavailable.\n"
+                + (f"- Headless browser: {self.render_note}\n" if self.render_note else "")
+                + "- Try web_fetch on this URL; if that also fails, record the page as unavailable.\n"
             )
         lines = [
             f"### {self.label}",
             f"- URL: {self.requested_url} (final: {self.final_url}, HTTP {self.status_code})",
+            f"- Fetch method: {self.method_summary()}",
             f"- Title: {self.title or '(none)'}",
             f"- Meta description: {self.meta_description or '(none)'}",
             f"- H1: {' | '.join(self.h1) or '(none)'}",
@@ -283,6 +322,13 @@ class PageSnapshot:
             f"- FAQ schema present: {'yes' if self.has_faq_schema else 'no'}",
             f"- Visible word count: {self.word_count}"
             + (" (very low - page is likely client-side rendered; consider web_fetch)" if self.word_count < 150 else ""),
+        ]
+        if self.js_rendered:
+            lines.append(
+                "- JAVASCRIPT-RENDERED: missing from the raw HTML, visible only after JavaScript runs: "
+                + "; ".join(detail for _, detail in self.js_missing)
+            )
+        lines += [
             f"- Visible text excerpt (first {PAGE_TEXT_CHARS} chars):",
             "```",
             self.text_excerpt,
@@ -305,7 +351,38 @@ HTTP.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.
 
 
 def fetch_page(url: str, label: str) -> PageSnapshot:
-    """Fetch and snapshot a page. Never raises: failures are recorded on the snapshot."""
+    """Fetch and snapshot a page, falling back to a headless browser for thin or blocked pages.
+
+    Tries a plain HTTP request first. If that returns fewer than JS_RENDER_MIN_WORDS words (or is
+    blocked by bot protection), the page is rendered in headless Chromium and the richer version is
+    kept. snap.fetch_method records which one was used, and snap.js_missing lists key content that
+    only appeared after JavaScript ran. Never raises: failures are recorded on the snapshot.
+    """
+    snap = _fetch_standard(url, label)
+    thin = snap.ok and snap.word_count < JS_RENDER_MIN_WORDS
+    blocked = not snap.ok and snap.status_code in BROWSER_RETRY_STATUSES
+    if not (thin or blocked):
+        return snap
+
+    rendered = render_with_browser(url, label)
+    if not rendered.ok:
+        snap.render_note = f"headless browser retry failed: {rendered.error}"
+        return snap
+    rendered.fetch_method = "playwright"
+    if blocked:
+        rendered.render_note = f"plain request was blocked ({snap.error})"
+        return rendered
+
+    rendered.raw_word_count = snap.word_count
+    rendered.js_missing = detect_js_only_content(snap, rendered)
+    if rendered.js_missing or rendered.word_count >= snap.word_count + 100:
+        return rendered
+    snap.render_note = f"headless browser retry found no extra content ({rendered.word_count:,} words)"
+    return snap
+
+
+def _fetch_standard(url: str, label: str) -> PageSnapshot:
+    """Plain HTTP fetch (no JavaScript)."""
     snap = PageSnapshot(label=label, requested_url=url)
     try:
         resp = HTTP.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
@@ -390,6 +467,7 @@ def _parse_html(html: str, base_url: str, snap: PageSnapshot) -> None:
         tag.decompose()
     text = " ".join(soup.get_text(" ", strip=True).split())
     snap.word_count = len(text.split())
+    snap.text = text
     snap.text_excerpt = text[:PAGE_TEXT_CHARS]
 
 
@@ -405,6 +483,196 @@ def _collect_ld_types(node, types: set[str]) -> None:
     elif isinstance(node, list):
         for v in node:
             _collect_ld_types(v, types)
+
+
+_BROWSER_LOCK = threading.Lock()  # one Chromium at a time keeps memory predictable on small hosts
+_browser_unavailable = ""  # set once if Playwright/Chromium can't start, so we stop retrying
+
+
+def render_with_browser(url: str, label: str) -> PageSnapshot:
+    """Load a page in headless Chromium (Playwright) and snapshot the rendered DOM. Never raises."""
+    global _browser_unavailable
+    snap = PageSnapshot(label=label, requested_url=url)
+    if _browser_unavailable:
+        snap.error = _browser_unavailable
+        return snap
+    try:
+        from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        _browser_unavailable = snap.error = "Playwright is not installed (pip install playwright)"
+        return snap
+
+    launch_args: dict = {"headless": True}
+    if os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE"):  # use a system/preinstalled Chromium
+        launch_args["executable_path"] = os.environ["PLAYWRIGHT_CHROMIUM_EXECUTABLE"]
+    with _BROWSER_LOCK:
+        try:
+            with sync_playwright() as pw:
+                try:
+                    browser = pw.chromium.launch(**launch_args)
+                except PlaywrightError as e:
+                    first_line = str(e).strip().splitlines()[0][:160]
+                    _browser_unavailable = snap.error = (
+                        f"Chromium could not start ({first_line}); run `playwright install chromium`"
+                    )
+                    return snap
+                try:
+                    page = browser.new_page(user_agent=USER_AGENT, locale="en-US")
+                    resp = page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT_MS)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=8_000)
+                    except PlaywrightError:
+                        pass  # pages with analytics or chat widgets may never go idle; use what loaded
+                    snap.status_code = resp.status if resp else None
+                    snap.final_url = page.url
+                    if snap.status_code and snap.status_code >= 400:
+                        snap.error = f"HTTP {snap.status_code}"
+                        return snap
+                    _parse_html(page.content(), page.url, snap)
+                    snap.ok = True
+                finally:
+                    browser.close()
+        except Exception as e:  # navigation timeouts, crashes - never stop the audit
+            snap.error = f"{type(e).__name__}: {str(e).strip().splitlines()[0][:200]}"
+    return snap
+
+
+def _cta_text(entry: str) -> str:
+    return entry.split(" -> ")[0].replace(" [button]", "").strip()
+
+
+def detect_js_only_content(raw: PageSnapshot, rendered: PageSnapshot) -> list[tuple[str, str]]:
+    """Key content present after rendering but missing from the raw HTML, as (short, detailed) pairs."""
+    missing: list[tuple[str, str]] = []
+
+    raw_prices = len(PRICE_PATTERN.findall(raw.text))
+    rendered_prices = PRICE_PATTERN.findall(rendered.text)
+    if len(rendered_prices) >= 2 and raw_prices * 2 < len(rendered_prices):
+        # Prefer currency amounts as examples ("$349") over phrases like "per month".
+        amounts = sorted(dict.fromkeys(p.strip() for p in rendered_prices), key=lambda t: t[0] not in "$€£")
+        missing.append(("pricing", f"pricing ({len(rendered_prices)} price mentions, e.g. {', '.join(amounts[:3])})"))
+
+    raw_ctas = {_cta_text(c).lower() for c in raw.ctas}
+    new_ctas = [_cta_text(c) for c in rendered.ctas if _cta_text(c).lower() not in raw_ctas]
+    if new_ctas:
+        quoted = ", ".join(f"'{t}'" for t in new_ctas[:3])
+        missing.append(("CTAs", f"calls to action such as {quoted}"))
+
+    if rendered.h1 and not raw.h1:
+        missing.append(("the main headline", f"the main headline ('{rendered.h1[0][:80]}')"))
+    elif len(rendered.h2) >= len(raw.h2) + 3:
+        missing.append(("section headings", f"{len(rendered.h2) - len(raw.h2)} section headings"))
+
+    if rendered.forms and not raw.forms:
+        missing.append(("forms", "the page's forms (e.g. signup or contact fields)"))
+
+    new_schema = [t for t in rendered.schema_types if t not in raw.schema_types]
+    if new_schema:
+        missing.append(("structured data", f"structured data ({', '.join(new_schema)})"))
+
+    if rendered.word_count >= max(2 * raw.word_count, raw.word_count + 150):
+        missing.append(
+            ("body copy", f"most of the body copy ({raw.word_count:,} of {rendered.word_count:,} words are in the raw HTML)")
+        )
+    return missing
+
+
+def _join(items: list[str]) -> str:
+    items = list(dict.fromkeys(items))
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def build_js_findings(ctx: "AuditContext") -> dict[int, dict[str, str]]:
+    """Turn JavaScript-rendered target pages into Layer 1 (CRO) and Layer 3 (SEO/AEO) observations.
+
+    Returns {layer number: {"observed", "why", "hypothesis", "notes"}} or {} when nothing was flagged.
+    """
+    flagged = [s for s in ctx.pages.values() if s.js_rendered]
+    if not flagged:
+        return {}
+    shorts = _join([short for s in flagged for short, _ in s.js_missing])
+    details = "; ".join(f"{_join([d for _, d in s.js_missing])} on the {s.label.lower()}" for s in flagged)
+    evidence = "; ".join(
+        f"{s.label}: {s.raw_word_count:,} words in raw HTML vs {s.word_count:,} after rendering ({s.final_url})"
+        for s in flagged
+    )
+    has_pricing = any(short == "pricing" for s in flagged for short, _ in s.js_missing)
+    lead = "Pricing and other key content is" if has_pricing else "Key content is"
+    page_names = _join([s.label.lower() for s in flagged])
+
+    l1_observed = (
+        f"{lead} client-side injected via JavaScript. Visitors on slow connections or with JS disabled "
+        f"cannot see {details}."
+    )
+    l1_why = "This creates conversion risk on first load."
+    l3_observed = f"Key page content including {shorts} is JavaScript-rendered and not present in raw HTML."
+    l3_why = (
+        "This means AI crawlers, search engine bots, and tools like ChatGPT and Perplexity cannot reliably "
+        "index this content. Any query asking about pricing or features will return outdated or "
+        "third-party sourced figures rather than the live page content."
+    )
+    footer = f"_Automated check - detected by comparing a plain HTTP fetch with a headless-browser render. {evidence}._"
+    return {
+        1: {
+            "observed": l1_observed,
+            "why": l1_why,
+            "hypothesis": (
+                f"Server-render (or pre-render) {shorts} on the {page_names} so it is in the first HTML response; "
+                "measure first-load bounce rate and pricing-to-signup conversion on mobile/slow-connection sessions before vs. after."
+            ),
+            "notes": f"## Automated check: JavaScript-rendered content (CRO)\n\n{l1_observed} {l1_why}\n\n{footer}",
+        },
+        3: {
+            "observed": l3_observed,
+            "why": l3_why,
+            "hypothesis": (
+                f"Ship {shorts} in the raw HTML (SSR/static rendering) and mirror key figures in llms.txt; re-run the "
+                "same AI answer-engine probes and track whether answers quote the live figures and cite the company's own URLs."
+            ),
+            "notes": f"## Automated check: JavaScript-rendered content (SEO/AEO)\n\n{l3_observed} {l3_why}\n\n{footer}",
+        },
+    }
+
+
+def inject_js_findings(body: str, findings: dict[int, dict[str, str]]) -> str:
+    """Insert the automated JS findings as the first observation under Layers 1 and 3 in section 3."""
+    if not findings:
+        return body
+    lines = body.splitlines()
+    leftovers = []
+    for layer_no, f in sorted(findings.items()):
+        bullet = f"- **Observed:** {f['observed']} → **Why it matters:** {f['why']} → **Hypothesis to test:** {f['hypothesis']}"
+        sec_start = next((i for i, ln in enumerate(lines) if re.match(r"^##\s+3\.|^##\s+.*Channel-by-Channel", ln)), None)
+        if sec_start is None:
+            leftovers.append((layer_no, bullet))
+            continue
+        sec_end = next((i for i in range(sec_start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+        head = next(
+            (i for i in range(sec_start + 1, sec_end) if re.match(rf"^###\s+.*Layer\s*{layer_no}\b", lines[i])), None
+        )
+        if head is None:
+            leftovers.append((layer_no, bullet))
+            continue
+        pos = head + 1
+        if pos < len(lines) and not lines[pos].strip():
+            pos += 1
+        lines.insert(pos, bullet)
+    body = "\n".join(lines)
+    if leftovers:
+        body = body.rstrip() + "\n\n## Automated Findings\n"
+        for layer_no, bullet in leftovers:
+            body += f"\n### {LAYER_TITLES[layer_no - 1]}\n\n{bullet}\n"
+    return body + "\n"
+
+
+def fetch_methods_note(snaps: list[PageSnapshot]) -> str:
+    """One markdown line per page saying how it was fetched, for the end of a layer's notes."""
+    rows = [
+        f"- {s.label}: {s.method_summary() if s.ok else 'not retrieved locally (' + (s.error or 'error') + ')'}"
+        for s in snaps
+    ]
+    return "**Page fetch methods (local snapshots):**\n" + "\n".join(rows)
 
 
 def discover_page(
@@ -429,7 +697,8 @@ def discover_page(
     for url in candidates[:6]:  # cap requests per page type
         snap = fetch_page(url, label)
         if snap.ok:
-            progress.info(f"{label}: {url}")
+            via = " (rendered in headless browser)" if snap.fetch_method == "playwright" else ""
+            progress.info(f"{label}: {url}{via}")
             return snap
         failures.append((url, snap.error))
 
@@ -625,6 +894,7 @@ class AuditContext:
     keywords: list[str] = field(default_factory=list)
     llms_txt: str = ""
     fetch_log: list[str] = field(default_factory=list)
+    js_findings: dict[int, dict[str, str]] = field(default_factory=dict)
 
     def intro(self) -> str:
         comps = ", ".join(self.competitors) or "(none provided)"
@@ -843,7 +1113,9 @@ def synthesize(r: Researcher, ctx: AuditContext, notes: dict[str, str]) -> str:
         "3-4 specific metrics or analytics questions (e.g. funnel conversion rates by step, paid search "
         "impression share on named keywords, cohort activation times) and what each would confirm or kill.\n\n"
         "Rules: stay faithful to the notes - do not add facts that are not in them; keep OBSERVED vs INFERRED "
-        "distinctions; write for a growth lead who will act on this.\n\n"
+        "distinctions; write for a growth lead who will act on this. Sections headed 'Automated check: "
+        "JavaScript-rendered content' are inserted into section 3 by the tool itself - do not restate them "
+        "as observations (you may still weigh them in the Priority Stack).\n\n"
         f"# Raw research notes\n\n{joined}",
         tools=None,
     )
@@ -959,7 +1231,8 @@ def fetch_all_pages(ctx: AuditContext, progress: Progress) -> None:
     """Fetch target and competitor pages locally, logging every outcome."""
     home = fetch_page(ctx.url, "Homepage")
     if home.ok:
-        progress.info(f"Homepage: {ctx.url}")
+        via = " (rendered in headless browser)" if home.fetch_method == "playwright" else ""
+        progress.info(f"Homepage: {ctx.url}{via}")
     else:
         progress.warn(f"Homepage fetch failed ({home.error}) - Claude will try web_fetch instead")
     ctx.pages["home"] = home
@@ -981,9 +1254,42 @@ def fetch_all_pages(ctx: AuditContext, progress: Progress) -> None:
     all_snaps = list(ctx.pages.values()) + [s for d in ctx.competitor_pages.values() for s in d.values()]
     for s in all_snaps:
         ctx.fetch_log.append(
-            f"{s.label}: {s.final_url or s.requested_url} - OK (HTTP {s.status_code})" if s.ok
+            f"{s.label}: {s.final_url or s.requested_url} - OK (HTTP {s.status_code}, {s.method_summary()})" if s.ok
             else f"{s.label}: {s.requested_url} - FAILED ({s.error})"
+            + (f" [headless browser: {s.render_note}]" if not s.ok and s.render_note else "")
         )
+    if _browser_unavailable:
+        progress.warn(f"Headless browser fallback unavailable: {_browser_unavailable}")
+
+    ctx.js_findings = build_js_findings(ctx)
+    if ctx.js_findings:
+        pages = _join([s.label for s in ctx.pages.values() if s.js_rendered])
+        progress.warn(f"JavaScript-rendered content on {pages} - flagged as a CRO (L1) and SEO/AEO (L3) finding")
+
+
+def layer_page_snapshots(ctx: AuditContext, index: int) -> list[PageSnapshot]:
+    """The local page snapshots each layer's prompt was built from."""
+    target = list(ctx.pages.values())
+    if index in (1, 3):
+        return target
+    if index == 2:
+        return [ctx.pages["home"]] if "home" in ctx.pages else []
+    if index == 4:
+        return [ctx.pages["signup"]] if "signup" in ctx.pages else []
+    return [ctx.pages[k] for k in ("home", "pricing") if k in ctx.pages] + [
+        s for d in ctx.competitor_pages.values() for s in d.values()
+    ]
+
+
+def annotate_layer_notes(ctx: AuditContext, index: int, notes: str) -> str:
+    """Append the automated JS finding (Layers 1 and 3) and the page fetch methods to a layer's notes."""
+    extra = []
+    if index in ctx.js_findings:
+        extra.append(ctx.js_findings[index]["notes"])
+    snaps = layer_page_snapshots(ctx, index)
+    if snaps:
+        extra.append(fetch_methods_note(snaps))
+    return notes.rstrip() + "\n\n" + "\n\n".join(extra) if extra else notes
 
 
 @dataclass
@@ -1056,6 +1362,8 @@ def run_audit(
                 progress.layer_finished(index, title, notes[title], True)
                 continue
             notes[title], ok = safe_layer(title, progress, lambda fn=fn: fn(researcher, ctx))
+            if ok:
+                notes[title] = annotate_layer_notes(ctx, index, notes[title])
             progress.layer_finished(index, title, notes[title], ok)
             if ok:
                 completed[title] = notes[title]
@@ -1068,13 +1376,14 @@ def run_audit(
         try:
             with progress.spin("Synthesizing findings"):
                 body = synthesize(researcher, ctx, notes)
+            body = inject_js_findings(body, ctx.js_findings)
         except anthropic.AuthenticationError:
             raise
         except Exception as e:
             if is_out_of_credits(e):
                 raise OutOfCreditsError(str(e)) from e
             progress.warn(f"Synthesis failed ({type(e).__name__}: {e}); saving raw layer notes instead")
-            body = "_Synthesis failed; see the raw layer notes in Appendix B._\n"
+            body = inject_js_findings("_Synthesis failed; see the raw layer notes in Appendix B._\n", ctx.js_findings)
             return AuditOutcome(body, notes, "partial", "The final synthesis step failed.", failed)
     except OutOfCreditsError:
         save_checkpoint(ctx, completed, researcher.sources)
