@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}{{ job.company|title }} · Growth Audit{% endblock %}
+{% block body_class %}page-audit{% endblock %}
+{% block head %}
+<!-- Vendored so the UI works offline: marked 12.0.2 (MIT), DOMPurify 3.1.6 (Apache-2.0 / MPL-2.0) -->
+<script src="{{ url_for('static', filename='vendor/marked.min.js') }}" defer></script>
+<script src="{{ url_for('static', filename='vendor/purify.min.js') }}" defer></script>
+{% endblock %}
+{% block content %}
+<div id="app"
+     data-id="{{ job.id }}"
+     data-status="{{ job.status }}"
+     data-events-url="{{ url_for('audit_events', audit_id=job.id) }}"
+     data-result-url="{{ url_for('audit_result', audit_id=job.id) }}"
+     data-notes-url="{{ url_for('save_notes', audit_id=job.id) }}"
+     data-report-url="{{ url_for('download_report', audit_id=job.id) }}">
+
+  <!-- ============================ LIVE PROGRESS VIEW ============================ -->
+  <section id="progress-view" class="view" {% if job.done %}hidden{% endif %} aria-live="polite">
+    <header class="run-head">
+      <div>
+        <p class="eyebrow"><span class="pulse-dot"></span><span id="run-state">Audit in progress</span></p>
+        <h1 class="run-title">{{ job.company|title }}</h1>
+        <p class="run-meta">
+          <span class="meta-item"><span class="meta-key">URL</span>{{ job.url }}</span>
+          <span class="meta-item"><span class="meta-key">ICP</span>{{ job.icp }}</span>
+          {% if job.competitors %}<span class="meta-item"><span class="meta-key">VS</span>{{ job.competitors|join(', ') }}</span>{% endif %}
+        </p>
+      </div>
+      <div class="run-clock">
+        <span class="clock-label">Elapsed</span>
+        <span class="clock" id="clock">00:00</span>
+      </div>
+    </header>
+
+    <!-- Step indicator: prep, the five layers, report -->
+    <div class="stepper" id="stepper" role="list">
+      {% set steps = [('prep', 'PRE', 'Pages & keywords')] %}
+      {% for short in layer_short %}{% set _ = steps.append(('L' ~ loop.index, 'L' ~ loop.index, short)) %}{% endfor %}
+      {% set _ = steps.append(('report', 'RPT', 'Report')) %}
+      {% for key, label, desc in steps %}
+      <div class="step" data-step="{{ key }}" data-state="pending" role="listitem">
+        <div class="step-node">
+          <svg class="step-ring" viewBox="0 0 36 36" aria-hidden="true"><circle cx="18" cy="18" r="16"/></svg>
+          <svg class="step-check" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>
+          <span class="step-x" aria-hidden="true">×</span>
+          <span class="step-label">{{ label }}</span>
+        </div>
+        <span class="step-desc">{{ desc }}</span>
+      </div>
+      {% endfor %}
+    </div>
+    <div class="progress-track" aria-hidden="true">
+      <div class="progress-fill" id="progress-fill"></div>
+    </div>
+    <p class="progress-caption"><span id="progress-pct">0%</span> · <span id="progress-label">Starting…</span></p>
+
+    <div id="keywords" class="keyword-row" hidden>
+      <span class="section-label">High-intent keywords</span>
+      <div class="chips" id="keyword-chips"></div>
+    </div>
+
+    <div class="run-grid">
+      <div class="layer-cards" id="layer-cards">
+        {% for short in layer_short %}
+        <article class="layer-card" data-layer="{{ loop.index }}" data-state="pending">
+          <header class="layer-card-head">
+            <span class="layer-code">L{{ loop.index }}</span>
+            <h3>{{ short }}</h3>
+            <span class="layer-state">Queued</span>
+          </header>
+          <div class="layer-card-body">
+            <div class="skeleton" aria-hidden="true"><span></span><span></span><span></span></div>
+            <p class="layer-activity" hidden></p>
+            <div class="layer-summary md" hidden></div>
+          </div>
+        </article>
+        {% endfor %}
+      </div>
+
+      <aside class="terminal" aria-label="Live activity log">
+        <header class="terminal-head">
+          <span class="terminal-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span class="terminal-title"><span class="live-dot"></span>Live feed</span>
+          <label class="autoscroll"><input type="checkbox" id="autoscroll" checked> auto-scroll</label>
+        </header>
+        <ol class="log" id="log"></ol>
+      </aside>
+    </div>
+  </section>
+
+  <!-- ============================== RESULTS VIEW =============================== -->
+  <section id="results-view" class="view" hidden></section>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/audit.js') }}" defer></script>
+{% endblock %}
