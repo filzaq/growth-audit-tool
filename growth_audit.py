@@ -576,6 +576,9 @@ def generate_keywords(researcher: Researcher, ctx: AuditContext) -> list[str]:
         "when actively evaluating or switching to a product like the target company's. Mix: one category "
         "'best X for Y' query, one 'switch from <competitor>' query, one pricing-model query, one "
         "cost/fees query, and one ICP-vertical-specific query. Use the language real buyers use.\n"
+        f"Do NOT include the target company's brand name ({company_name(ctx.url)}) in any query: these "
+        "must be unbranded searches from prospects who have not yet chosen a provider. Naming a "
+        "competitor the ICP is switching away from is fine.\n"
         'Respond with ONLY a JSON array of 5 strings, e.g. ["query one", "query two", ...].'
     )
     try:
