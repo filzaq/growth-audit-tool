@@ -898,7 +898,10 @@ def fetch_all_pages(ctx: AuditContext, progress: Progress) -> None:
         ctx.pages[key] = discover_page(home, ctx.url, key, progress)
 
     ctx.llms_txt = check_llms_txt(ctx.url)
-    progress.info("llms.txt: " + ctx.llms_txt.splitlines()[0].split(": ", 1)[-1])
+    llms_status = ctx.llms_txt.splitlines()[0].split(": ", 1)[-1]
+    if llms_status.startswith("LOCAL CHECK FAILED"):
+        llms_status = "local check failed - Claude will verify with web_fetch"
+    progress.info("llms.txt: " + llms_status)
 
     for comp in ctx.competitors:
         chome = fetch_page(comp, f"{bare_domain(comp)} homepage")
