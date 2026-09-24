@@ -87,13 +87,23 @@ web: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --worker-class gthread --
 ```
 
 1. Create a Railway project from this GitHub repo. Railway installs `requirements.txt` and uses the Procfile.
-2. Under **Variables**, add `ANTHROPIC_API_KEY`. You can also add `CLAUDE_MODEL` to change the model from the default `claude-opus-5`. Railway sets `PORT` itself.
+2. Under **Variables**, add `ANTHROPIC_API_KEY` and `APP_PASSWORD`. You can also add `CLAUDE_MODEL` to change the model from the default `claude-opus-5`. Railway sets `PORT` itself.
 3. Under **Settings → Networking**, generate a domain.
 
 Why the Procfile looks like this:
 - **One worker.** Audits and field notes are kept in the worker's memory. A second worker would have its own separate set of audits, and progress streams would miss events. Threads handle concurrent SSE streams and requests.
 - **Data loss on restart.** A redeploy or restart clears in-memory audits and the report files written to the container's disk. Download reports you want to keep.
-- **Anyone with the URL can use it.** The app has no login, so anyone who finds the URL can start audits billed to your API key. Keep the domain private, or put authentication in front of it.
+- **Set `APP_PASSWORD`.** Without it, anyone who finds the URL can start audits billed to your API key. The app logs a warning at startup when it's deployed without one.
+
+### Password protection
+
+When `APP_PASSWORD` is set, every page requires signing in first.
+- **Sign-in:** a login page opens a signed session cookie that lasts 30 days and is `HttpOnly` and `SameSite=Lax`. On Railway it's also marked `Secure`.
+- **Brute-force protection:** after 5 wrong passwords, that IP address is locked out for 15 minutes.
+- **Signing everyone out:** changing `APP_PASSWORD` invalidates all existing sessions. You can also set your own `SECRET_KEY` for signing sessions.
+- **Sign out:** a **Sign out** link appears in the top bar.
+
+Without `APP_PASSWORD`, the app stays open, which is fine for running it on your own machine.
 
 `python app.py` also reads `PORT` from the environment. When `PORT` is set, it listens on `0.0.0.0`; otherwise it uses `127.0.0.1:5000`.
 

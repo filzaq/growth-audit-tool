@@ -11,6 +11,8 @@ Three views:
     /audit/<id>         live progress (Server-Sent Events) that turns into the results view
     /audit/<id>/report.md   the full markdown report, including the analyst's field notes
 
+Set APP_PASSWORD to require a sign-in (recommended for any deployment others can reach).
+
 The audit itself is growth_audit.run_audit(), executed in a background thread. A Progress subclass
 turns its callbacks into events; each audit keeps its event history in memory so any number of
 browser tabs can connect (or reconnect) and replay the stream from the start.
@@ -20,6 +22,8 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -38,9 +42,11 @@ from flask import (
     redirect,
     render_template,
     request,
+    session,
     stream_with_context,
     url_for,
 )
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 import growth_audit as ga
 
@@ -48,8 +54,112 @@ load_dotenv()
 
 app = Flask(__name__)
 
+# Railway (and similar hosts) terminate HTTPS at a proxy. Trust its X-Forwarded-* headers there so
+# we see the real client IP (for login throttling) and scheme; don't trust them anywhere else.
+ON_RAILWAY = any(k in os.environ for k in ("RAILWAY_ENVIRONMENT_NAME", "RAILWAY_ENVIRONMENT", "RAILWAY_PUBLIC_DOMAIN"))
+if ON_RAILWAY or os.environ.get("TRUST_PROXY") == "1":
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 # Short names used in the UI for the five layers (same order as ga.LAYER_TITLES).
 LAYER_SHORT = ["Web Conversion", "Paid Acquisition", "Organic & AEO", "Lifecycle", "Competitive"]
+
+
+# ---------------------------------------------------------------------------
+# Optional password protection
+# ---------------------------------------------------------------------------
+# With APP_PASSWORD set, every page needs a sign-in; without it the app is open (fine on localhost).
+# Sign-in stores a flag in Flask's signed session cookie, which the browser also sends on the
+# EventSource (SSE) connection, so live progress keeps working after sign-in.
+
+app.config["APP_PASSWORD"] = os.environ.get("APP_PASSWORD", "")
+# Sessions are signed with SECRET_KEY. If none is given, derive one from the password so sessions
+# survive restarts and redeploys, and changing the password signs everyone out.
+app.secret_key = os.environ.get("SECRET_KEY") or hashlib.sha256(
+    b"growth-audit-session:" + app.config["APP_PASSWORD"].encode()
+).hexdigest()
+app.config.update(
+    PERMANENT_SESSION_LIFETIME=dt.timedelta(days=30),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",  # cookie isn't sent on cross-site POSTs, which blocks CSRF
+    SESSION_COOKIE_SECURE=ON_RAILWAY or os.environ.get("SESSION_COOKIE_SECURE") == "1",
+)
+
+LOGIN_MAX_FAILURES = 5  # per client IP ...
+LOGIN_WINDOW = 15 * 60  # ... within this many seconds, then locked out for the rest of the window
+_login_failures: dict[str, list[float]] = {}
+_login_lock = threading.Lock()
+
+
+def password_required() -> bool:
+    return bool(app.config["APP_PASSWORD"])
+
+
+def _recent_failures(ip: str) -> list[float]:
+    cutoff = time.time() - LOGIN_WINDOW
+    with _login_lock:
+        attempts = [t for t in _login_failures.get(ip, []) if t > cutoff]
+        _login_failures[ip] = attempts
+        return attempts
+
+
+def _record_failure(ip: str) -> None:
+    with _login_lock:
+        _login_failures.setdefault(ip, []).append(time.time())
+
+
+def _safe_next(target: str | None) -> str:
+    """Only redirect back to a path on this site (never //evil.com or https://evil.com)."""
+    if target and target.startswith("/") and not target.startswith("//") and "\\" not in target:
+        return target
+    return url_for("index")
+
+
+@app.before_request
+def require_login():
+    if not password_required() or session.get("authed"):
+        return None
+    if request.endpoint in ("login", "static"):
+        return None
+    # API and SSE callers get a status code, not an HTML redirect they can't follow.
+    if request.path.startswith("/api/") or request.path.endswith("/events") or request.method != "GET":
+        return jsonify({"error": "Sign in required"}), 401
+    return redirect(url_for("login", next=request.full_path.rstrip("?")))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not password_required():
+        return redirect(url_for("index"))
+    next_url = _safe_next(request.values.get("next"))
+    if session.get("authed"):
+        return redirect(next_url)
+    error = ""
+    if request.method == "POST":
+        ip = request.remote_addr or "unknown"
+        if len(_recent_failures(ip)) >= LOGIN_MAX_FAILURES:
+            error = "Too many attempts. Try again in 15 minutes."
+            return render_template("login.html", error=error, next=next_url), 429
+        supplied = request.form.get("password", "")
+        if hmac.compare_digest(supplied.encode(), app.config["APP_PASSWORD"].encode()):
+            session.clear()
+            session["authed"] = True
+            session.permanent = True
+            return redirect(next_url)
+        _record_failure(ip)
+        time.sleep(0.5)  # slow down guessing
+        error = "That password isn't right."
+        return render_template("login.html", error=error, next=next_url), 401
+    return render_template("login.html", error=error, next=next_url)
+
+
+@app.post("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.context_processor
+def auth_context():
+    return {"auth_enabled": password_required()}
 
 
 # ---------------------------------------------------------------------------
@@ -597,6 +707,8 @@ def main() -> None:
         print(f"Loaded {path} -> http://{args.host}:{args.port}/audit/{job.id}")
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print("Warning: ANTHROPIC_API_KEY is not set; new audits can't run until it is added to .env.")
+    if not password_required() and args.host not in ("127.0.0.1", "localhost"):
+        print("Warning: APP_PASSWORD is not set, so anyone who can reach this server can run audits on your API key.")
     print(f"Growth Audit UI running at http://{args.host}:{args.port}")
     # threaded=True so SSE streams, note saves and the audit thread don't block each other.
     app.run(host=args.host, port=args.port, threaded=True, debug=False)
@@ -604,6 +716,8 @@ def main() -> None:
 
 # Used when the app is served by gunicorn (Procfile), where main() doesn't run.
 app.config.setdefault("MODEL", os.environ.get("CLAUDE_MODEL", ga.DEFAULT_MODEL))
+if ON_RAILWAY and not password_required():
+    print("Warning: APP_PASSWORD is not set, so anyone with this app's URL can run audits on your API key.", flush=True)
 
 if __name__ == "__main__":
     main()

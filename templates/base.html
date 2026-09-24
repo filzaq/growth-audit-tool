@@ -23,7 +23,14 @@
     </a>
     <nav class="topnav">
       {% block nav %}{% endblock %}
+      {% if request.endpoint != 'login' %}
       <a class="topnav-link" href="{{ url_for('index') }}">New audit</a>
+      {% if auth_enabled %}
+      <form method="post" action="{{ url_for('logout') }}" class="topnav-form">
+        <button type="submit" class="topnav-link topnav-button">Sign out</button>
+      </form>
+      {% endif %}
+      {% endif %}
     </nav>
   </header>
   <main>
