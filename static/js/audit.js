@@ -193,6 +193,12 @@
       $("#keyword-chips").innerHTML = ev.keywords.map((k, n) => `<span class="chip" style="animation-delay:${n * 60}ms">${esc(k)}</span>`).join("");
     }));
     es.addEventListener("complete", handle((ev) => { es.close(); onComplete(ev); }));
+    // The browser retries dropped streams by itself; it gives up (CLOSED) only on errors such as
+    // an expired sign-in, so point the user at a reload instead of freezing silently.
+    es.addEventListener("error", () => {
+      if (es.readyState !== EventSource.CLOSED) return;
+      appendLog({ level: "error", t: 0, text: "Lost connection to the server. Reload the page to reconnect (you may need to sign in again)." });
+    });
     setInterval(tickClock, 1000);
   }
 
@@ -424,6 +430,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ layer: Number(layer), text }),
       });
+      if (res.status === 401) { setSaveState(layer, "error", "Signed out — reload to sign in, then re-save"); return; }
       if (!res.ok) throw new Error(res.status);
       const data = await res.json();
       setSaveState(layer, "saved", `Saved · ${data.at}`);

@@ -32,9 +32,12 @@ Requires Python 3.10+.
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+playwright install chromium      # headless browser for JavaScript-rendered pages
 
 cp .env.example .env             # then edit .env and paste your key
 ```
+
+`playwright install chromium` is optional. Without it, the audit still runs, but it can't see pages that are built by JavaScript (see [JavaScript-rendered pages](#javascript-rendered-pages)).
 
 `.env` should contain:
 
@@ -80,20 +83,38 @@ Audit state lives in memory while the server runs. Each finished report is also 
 
 ### Deploying to Railway
 
-The repo includes a `Procfile`, so Railway runs the app with gunicorn:
+Railway reads `railway.toml` from the repo root:
 
-```
-web: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --worker-class gthread --threads 16 --timeout 120
+```toml
+[build]
+buildCommand = "pip install -r requirements.txt && playwright install chromium"
+
+[deploy]
+startCommand = "gunicorn app:app --workers 1 --worker-class gthread --threads 16 --timeout 120"
 ```
 
-1. Create a Railway project from this GitHub repo. Railway installs `requirements.txt` and uses the Procfile.
-2. Under **Variables**, add `ANTHROPIC_API_KEY`. You can also add `CLAUDE_MODEL` to change the model from the default `claude-opus-5`. Railway sets `PORT` itself.
+- **Build command:** runs `playwright install chromium` on every deploy. Railway needs this to download the headless browser used for JavaScript-rendered pages; `pip install playwright` alone doesn't include it.
+- **Start command:** takes precedence over the `Procfile`, which is kept for other hosts. gunicorn picks up Railway's `PORT` automatically, so no `--bind` is needed.
+- **If Chromium can't start:** some images lack the system libraries Chromium needs. In that case, the audit logs "Headless browser fallback unavailable" and carries on without it. Changing the build command to `playwright install --with-deps chromium` installs those libraries on Debian/Ubuntu-based images.
+
+1. Create a Railway project from this GitHub repo.
+2. Under **Variables**, add `ANTHROPIC_API_KEY` and `APP_PASSWORD`. You can also add `CLAUDE_MODEL` to change the model from the default `claude-opus-5`. Railway sets `PORT` itself.
 3. Under **Settings → Networking**, generate a domain.
 
 Why the Procfile looks like this:
 - **One worker.** Audits and field notes are kept in the worker's memory. A second worker would have its own separate set of audits, and progress streams would miss events. Threads handle concurrent SSE streams and requests.
 - **Data loss on restart.** A redeploy or restart clears in-memory audits and the report files written to the container's disk. Download reports you want to keep.
-- **Anyone with the URL can use it.** The app has no login, so anyone who finds the URL can start audits billed to your API key. Keep the domain private, or put authentication in front of it.
+- **Set `APP_PASSWORD`.** Without it, anyone who finds the URL can start audits billed to your API key. The app logs a warning at startup when it's deployed without one.
+
+### Password protection
+
+When `APP_PASSWORD` is set, every page requires signing in first.
+- **Sign-in:** a login page opens a signed session cookie that lasts 30 days and is `HttpOnly` and `SameSite=Lax`. On Railway it's also marked `Secure`.
+- **Brute-force protection:** after 5 wrong passwords, that IP address is locked out for 15 minutes.
+- **Signing everyone out:** changing `APP_PASSWORD` invalidates all existing sessions. You can also set your own `SECRET_KEY` for signing sessions.
+- **Sign out:** a **Sign out** link appears in the top bar.
+
+Without `APP_PASSWORD`, the app stays open, which is fine for running it on your own machine.
 
 `python app.py` also reads `PORT` from the environment. When `PORT` is set, it listens on `0.0.0.0`; otherwise it uses `127.0.0.1:5000`.
 
@@ -142,6 +163,22 @@ Report saved to /path/to/helcim-growth-audit-2026-09-24.md
 
 A full run makes about 8 API calls, each with multiple web searches. Expect it to take roughly 5–15 minutes. It costs a few dollars in API usage, depending on the model and how much research each layer does.
 
+## JavaScript-rendered pages
+
+Each page is fetched with a plain HTTP request first. The page is re-rendered in headless Chromium through Playwright, without you having to do anything, when:
+- the raw HTML has fewer than 500 words, or
+- the request is blocked (401/403/429/503).
+
+The richer version is kept. Every layer's notes, and the page fetch log, record which method was used for each page (`standard HTTP` or `headless browser (Playwright)`).
+
+When the browser shows key content that the raw HTML didn't contain, the tool flags it as its own finding. That content can be pricing, calls to action, the main headline, forms, structured data such as FAQ schema, or most of the body copy. The finding is added as the first observation under both layers:
+- **Layer 1 (Web Conversion):** "Pricing/key content is client-side injected via JavaScript. Visitors on slow connections or with JS disabled cannot see *[the missing content]*. This creates conversion risk on first load."
+- **Layer 3 (Organic & AEO):** "Key page content including *[pricing/CTAs/…]* is JavaScript-rendered and not present in raw HTML. This means AI crawlers, search engine bots, and tools like ChatGPT and Perplexity cannot reliably index this content…"
+
+The bracketed parts are filled in from what was actually missing, for example "pricing (12 price mentions, e.g. $349, 0.35%), calls to action such as 'Get started free' … on the pricing page". A word-count footer shows the evidence. Short pages whose content is all in the raw HTML are not flagged.
+
+To use a Chromium you already have instead of Playwright's download, set `PLAYWRIGHT_CHROMIUM_EXECUTABLE=/path/to/chrome`.
+
 ## How it stays robust
 
 - **Page fetch failures are recorded, not fatal.** If a page returns an error, times out or can't be found, the failure goes into the fetch log. Claude is told to try `web_fetch` on that URL, and to mark the page unavailable if that also fails.
@@ -157,5 +194,5 @@ A full run makes about 8 API calls, each with multiple web searches. Expect it t
 - **Organic rankings** come from Anthropic's web search index, which only approximates Google's rankings. Treat positions as directional.
 - **AI answer engine.** The AEO probe asks Claude, with web search, to answer as a neutral answer engine. That is one engine. ChatGPT, Perplexity and Google AI Overviews may answer differently.
 - **Signup flows.** The tool never creates accounts or submits forms. Layer 4 only covers what is publicly visible, plus public onboarding documentation.
-- **JavaScript-heavy sites.** The local fetcher does not run JavaScript, so single-page apps can produce thin snapshots. These are flagged, and Claude is asked to use `web_fetch` for more detail.
+- **JavaScript-heavy sites.** Pages built by JavaScript are re-rendered in headless Chromium (see below). If Chromium isn't installed, those pages give thin snapshots, and Claude is asked to use `web_fetch` instead. `web_fetch` doesn't run JavaScript either.
 - **Payments-flavoured prompts.** The prompts are written for a payments/fintech audit (e.g. "best payment processor for [ICP]"). For another category, edit the prompts in `answer_engine_probe()` and `generate_keywords()`.
