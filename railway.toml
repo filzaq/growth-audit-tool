@@ -1,8 +1,5 @@
 [build]
-buildCommand = "pip install -r requirements.txt && playwright install chromium"
+buildCommand = "bash build.sh"
 
 [deploy]
-# One gthread worker: audits live in this process's memory and SSE streams are long-lived.
-# (Plain `gunicorn app:app` would use a single sync worker with a 30s timeout, which blocks and
-# kills the live progress stream.) gunicorn binds to Railway's $PORT automatically.
-startCommand = "gunicorn app:app --workers 1 --worker-class gthread --threads 16 --timeout 120"
+startCommand = "gunicorn app:app"
