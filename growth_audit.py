@@ -503,7 +503,19 @@ def render_with_browser(url: str, label: str) -> PageSnapshot:
         _browser_unavailable = snap.error = "Playwright is not installed (pip install playwright)"
         return snap
 
-    launch_args: dict = {"headless": True}
+    launch_args: dict = {
+        "headless": True,
+        # Required for Chromium inside containers (Railway, Docker, Heroku): no setuid sandbox,
+        # no /dev/shm reliance (it's tiny in containers), no GPU, and a single process.
+        "args": [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--no-zygote",
+            "--single-process",
+        ],
+    }
     if os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE"):  # use a system/preinstalled Chromium
         launch_args["executable_path"] = os.environ["PLAYWRIGHT_CHROMIUM_EXECUTABLE"]
     with _BROWSER_LOCK:
