@@ -78,6 +78,25 @@ Options: `--port 8080`, `--host 0.0.0.0` (to share on your network), `--model <i
 
 Audit state lives in memory while the server runs. Each finished report is also written to disk with the same filename the CLI uses, so nothing is lost when you stop the server.
 
+### Deploying to Railway
+
+The repo includes a `Procfile`, so Railway runs the app with gunicorn:
+
+```
+web: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --worker-class gthread --threads 16 --timeout 120
+```
+
+1. Create a Railway project from this GitHub repo. Railway installs `requirements.txt` and uses the Procfile.
+2. Under **Variables**, add `ANTHROPIC_API_KEY`. You can also add `CLAUDE_MODEL` to change the model from the default `claude-opus-5`. Railway sets `PORT` itself.
+3. Under **Settings → Networking**, generate a domain.
+
+Why the Procfile looks like this:
+- **One worker.** Audits and field notes are kept in the worker's memory. A second worker would have its own separate set of audits, and progress streams would miss events. Threads handle concurrent SSE streams and requests.
+- **Data loss on restart.** A redeploy or restart clears in-memory audits and the report files written to the container's disk. Download reports you want to keep.
+- **Anyone with the URL can use it.** The app has no login, so anyone who finds the URL can start audits billed to your API key. Keep the domain private, or put authentication in front of it.
+
+`python app.py` also reads `PORT` from the environment. When `PORT` is set, it listens on `0.0.0.0`; otherwise it uses `127.0.0.1:5000`.
+
 ## Command line
 
 ```bash
