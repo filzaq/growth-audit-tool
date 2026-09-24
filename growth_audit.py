@@ -280,6 +280,15 @@ class PageSnapshot:
         return "\n".join(lines) + "\n"
 
 
+def short_error(e: Exception) -> str:
+    """Condense verbose requests/urllib3 errors to their root cause for logs and prompts."""
+    msg = str(e)
+    cause = re.search(r"Caused by \w+\((.*)\)\)?$", msg)
+    if cause:
+        msg = cause.group(1)
+    return f"{type(e).__name__}: {msg[:200]}"
+
+
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"})
 
@@ -290,7 +299,7 @@ def fetch_page(url: str, label: str) -> PageSnapshot:
     try:
         resp = HTTP.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
     except requests.RequestException as e:
-        snap.error = f"{type(e).__name__}: {e}"
+        snap.error = short_error(e)
         return snap
 
     snap.status_code = resp.status_code
@@ -411,11 +420,13 @@ def discover_page(
         if snap.ok:
             progress.info(f"{label}: {url}")
             return snap
-        failures.append(f"{url} ({snap.error})")
+        failures.append((url, snap.error))
 
     progress.warn(f"{label}: not found - tried {len(failures)} URL(s)")
     missing = PageSnapshot(label=label, requested_url=candidates[0] if candidates else base)
-    missing.error = "No reachable page found. Tried: " + "; ".join(failures)
+    tried = ", ".join(u for u, _ in failures)
+    last_error = failures[-1][1] if failures else "no candidate URLs"
+    missing.error = f"No reachable page found. Tried: {tried} (last error: {last_error})"
     return missing
 
 
@@ -426,7 +437,7 @@ def check_llms_txt(base: str) -> str:
         resp = HTTP.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True)
     except requests.RequestException as e:
         return (
-            f"{url}: LOCAL CHECK FAILED ({type(e).__name__}: {e}). "
+            f"{url}: LOCAL CHECK FAILED ({short_error(e)}). "
             "Use web_fetch on this URL to determine whether llms.txt is present."
         )
     ctype = resp.headers.get("Content-Type", "")
@@ -515,21 +526,31 @@ class Researcher:
                         self.sources.setdefault(url, getattr(r, "title", "") or "")
 
 
-def safe_layer(name: str, progress: Progress, fn) -> str:
-    """Run a layer; if it fails, record the failure in the notes and keep the audit going."""
+class OutOfCreditsError(Exception):
+    """The API account has no credit left; every further call would fail, so stop and checkpoint."""
+
+
+def is_out_of_credits(e: Exception) -> bool:
+    return "credit balance" in str(e).lower()
+
+
+def safe_layer(name: str, progress: Progress, fn) -> tuple[str, bool]:
+    """Run a layer and return (notes, succeeded). Failures are recorded and the audit keeps going."""
     try:
         with progress.spin(f"Researching {name}"):
-            return fn()
+            return fn(), True
     except anthropic.AuthenticationError:
         raise  # a bad key will fail every layer - stop immediately with a clear message
     except anthropic.APIStatusError as e:
+        if is_out_of_credits(e):
+            raise OutOfCreditsError(str(e)) from e
         msg = f"API error {e.status_code}: {e.message}"
     except anthropic.APIConnectionError as e:
         msg = f"Connection error: {e}"
     except Exception as e:
         msg = f"{type(e).__name__}: {e}"
     progress.warn(f"{name} could not be completed ({msg}). Continuing.")
-    return f"**{name} could not be completed.** Reason: {msg}"
+    return f"**{name} could not be completed.** Reason: {msg}", False
 
 
 # ---------------------------------------------------------------------------
@@ -813,7 +834,56 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--competitors", default="", help="Comma-separated competitor URLs, e.g. square.com,stripe.com")
     p.add_argument("--keywords", default="", help="Optional: comma-separated keywords to use instead of generated ones")
     p.add_argument("--model", default=DEFAULT_MODEL, help=f"Claude model ID (default: {DEFAULT_MODEL})")
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse keywords and completed layers from the last interrupted run (same URL and ICP)",
+    )
     return p.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Checkpointing - completed layers are saved as they finish so an interrupted run
+# (out of credits, network loss, Ctrl-C) can be resumed without paying for them again.
+# ---------------------------------------------------------------------------
+
+
+def checkpoint_path(ctx: AuditContext) -> str:
+    return f"{ctx.company}-growth-audit.checkpoint.json"
+
+
+def save_checkpoint(ctx: AuditContext, completed: dict[str, str], sources: dict[str, str]) -> None:
+    data = {
+        "url": ctx.url,
+        "icp": ctx.icp,
+        "competitors": ctx.competitors,
+        "keywords": ctx.keywords,
+        "completed": completed,
+        "sources": sources,
+    }
+    with open(checkpoint_path(ctx), "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_checkpoint(ctx: AuditContext, progress: Progress) -> dict:
+    path = checkpoint_path(ctx)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        progress.warn(f"--resume: no checkpoint found at {path}; running the full audit")
+        return {}
+    except (OSError, json.JSONDecodeError) as e:
+        progress.warn(f"--resume: could not read {path} ({e}); running the full audit")
+        return {}
+    if data.get("url") != ctx.url or data.get("icp") != ctx.icp:
+        progress.warn("--resume: checkpoint was made for a different URL or ICP; running the full audit")
+        return {}
+    if data.get("competitors") != ctx.competitors and LAYER_TITLES[4] in data.get("completed", {}):
+        progress.warn("--resume: competitors changed; Layer 5 will be re-run")
+        del data["completed"][LAYER_TITLES[4]]
+    progress.info(f"Resuming from {path}: {len(data.get('completed', {}))} layer(s) already complete")
+    return data
 
 
 def fetch_all_pages(ctx: AuditContext, progress: Progress) -> None:
@@ -865,6 +935,14 @@ def main() -> int:
 
     print(f"Growth audit: {url}\nICP: {args.icp}\nCompetitors: {', '.join(competitors) or 'none'}")
 
+    checkpoint = load_checkpoint(ctx, progress) if args.resume else {}
+    completed: dict[str, str] = dict(checkpoint.get("completed", {}))
+    researcher.sources.update(checkpoint.get("sources", {}))
+
+    notes: dict[str, str] = {title: "_Not run._" for title in LAYER_TITLES}
+    body = "_Synthesis did not run; see the raw layer notes in Appendix B._\n"
+    exit_code = 0
+
     try:
         # Step 1: gather page snapshots locally (fast, no API cost).
         progress.header("Fetching pages (target + competitors)")
@@ -874,13 +952,17 @@ def main() -> int:
         progress.header("Choosing high-intent keywords")
         if args.keywords:
             ctx.keywords = [k.strip() for k in args.keywords.split(",") if k.strip()]
+        elif checkpoint.get("keywords"):
+            ctx.keywords = checkpoint["keywords"]
+            progress.info("Reusing keywords from checkpoint")
         else:
             with progress.spin("Generating ICP-specific keywords"):
                 ctx.keywords = generate_keywords(researcher, ctx)
         for k in ctx.keywords:
             progress.info(k)
 
-        # Steps 3-7: the five layers. Each failure is captured and the audit continues.
+        # Steps 3-7: the five layers. Each failure is captured and the audit continues;
+        # each success is checkpointed so it never has to be paid for twice.
         layers = [
             layer1_web_conversion,
             layer2_paid,
@@ -888,12 +970,18 @@ def main() -> int:
             layer4_lifecycle,
             layer5_competitive,
         ]
-        notes: dict[str, str] = {}
         for title, fn in zip(LAYER_TITLES, layers):
             progress.header(title)
-            notes[title] = safe_layer(title, progress, lambda fn=fn: fn(researcher, ctx))
+            if title in completed:
+                progress.info("Already complete - reusing notes from checkpoint")
+                notes[title] = completed[title]
+                continue
+            notes[title], ok = safe_layer(title, progress, lambda fn=fn: fn(researcher, ctx))
+            if ok:
+                completed[title] = notes[title]
+                save_checkpoint(ctx, completed, researcher.sources)
 
-        # Step 8: synthesize into the final report and save it.
+        # Step 8: synthesize into the final report.
         progress.header("Writing the audit report")
         try:
             with progress.spin("Synthesizing findings"):
@@ -901,22 +989,39 @@ def main() -> int:
         except anthropic.AuthenticationError:
             raise
         except Exception as e:
+            if is_out_of_credits(e):
+                raise OutOfCreditsError(str(e)) from e
             progress.warn(f"Synthesis failed ({type(e).__name__}: {e}); saving raw layer notes instead")
             body = "_Synthesis failed; see the raw layer notes in Appendix B._\n"
+            exit_code = 1
     except anthropic.AuthenticationError:
         print("\nError: the Anthropic API rejected the API key. Check ANTHROPIC_API_KEY.", file=sys.stderr)
         return 1
+    except OutOfCreditsError:
+        save_checkpoint(ctx, completed, researcher.sources)
+        print(
+            "\nStopped: your Anthropic account is out of API credit.\n"
+            f"Completed layers are saved in {checkpoint_path(ctx)}. Add credit in the Claude Console "
+            "(Plans & Billing), then re-run the same command with --resume to finish only what's missing.",
+            file=sys.stderr,
+        )
+        exit_code = 2
     except KeyboardInterrupt:
-        print("\nAudit cancelled.", file=sys.stderr)
+        save_checkpoint(ctx, completed, researcher.sources)
+        print("\nAudit cancelled. Progress saved; re-run with --resume to continue.", file=sys.stderr)
         return 130
 
     filename = f"{ctx.company}-growth-audit-{ctx.date}.md"
     with open(filename, "w", encoding="utf-8") as f:
         f.write(build_report(ctx, body, notes, researcher.sources))
 
+    # A clean, complete run no longer needs its checkpoint (and a stale one could be resumed by mistake).
+    if exit_code == 0 and len(completed) == len(LAYER_TITLES) and os.path.exists(checkpoint_path(ctx)):
+        os.remove(checkpoint_path(ctx))
+
     progress.done()
     print(f"Report saved to {os.path.abspath(filename)}")
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

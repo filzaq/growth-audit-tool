@@ -66,6 +66,11 @@ The report is saved in the current directory as `[company-name]-growth-audit-[da
 | `--competitors` | no | Comma-separated competitor URLs |
 | `--keywords` | no | Comma-separated keywords for Layers 2–3. If you leave this out, Claude writes 5 ICP-specific keywords |
 | `--model` | no | Claude model ID (default `claude-opus-5`) |
+| `--resume` | no | Continue an interrupted run: reuse its keywords and completed layers, and only run what's missing |
+
+### Resuming an interrupted run
+
+Each layer is saved to `<company>-growth-audit.checkpoint.json` as soon as it finishes. If a run stops partway, re-run the same command with `--resume` to finish only the missing layers and the final report. A run can stop because the API account runs out of credit, the network drops, or you press Ctrl-C. When the account is out of credit, the tool stops immediately rather than spending more attempts, and it tells you to resume. The checkpoint is deleted after a complete, successful run.
 
 ### Progress output
 
@@ -88,6 +93,7 @@ A full run makes about 8 API calls, each with multiple web searches. Expect it t
 
 - **Page fetch failures are recorded, not fatal.** If a page returns an error, times out or can't be found, the failure goes into the fetch log. Claude is told to try `web_fetch` on that URL, and to mark the page unavailable if that also fails.
 - **Page discovery.** The tool first looks for pricing, compare, contact sales and signup pages among the homepage's links. If none match, it tries common paths such as `/pricing`, `/compare`, `/calculator`, `/contact-sales` and `/signup`.
+- **Completed layers are checkpointed.** An interrupted run can be finished with `--resume` without paying for the finished layers again.
 - **Layer failures don't stop the audit.** If one layer's API call fails, the report says so and the other layers still run. If the final synthesis fails, the raw layer notes are still saved.
 - **Long research turns** that pause partway (`pause_turn`) are resumed automatically.
 - **Refusal fallback.** Requests opt into the API's server-side refusal fallback (`fallbacks: "default"`). If the model declines a request, the API re-runs it on a fallback model. If your account doesn't accept this beta, the tool turns it off and retries.
