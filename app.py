@@ -581,9 +581,12 @@ def download_report(audit_id: str):
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Web UI for the growth audit tool.")
-    p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=5000)
-    p.add_argument("--model", default=ga.DEFAULT_MODEL, help=f"Claude model ID (default: {ga.DEFAULT_MODEL})")
+    # Hosting platforms such as Railway inject PORT; listen on all interfaces when they do.
+    port = int(os.environ.get("PORT", 5000))
+    default_host = "0.0.0.0" if "PORT" in os.environ else "127.0.0.1"
+    p.add_argument("--host", default=os.environ.get("HOST", default_host))
+    p.add_argument("--port", type=int, default=port)
+    p.add_argument("--model", default=app.config["MODEL"], help=f"Claude model ID (default: {app.config['MODEL']})")
     p.add_argument("--load", action="append", default=[], help="Open a saved report .md in the UI (repeatable)")
     args = p.parse_args()
 
@@ -599,7 +602,8 @@ def main() -> None:
     app.run(host=args.host, port=args.port, threaded=True, debug=False)
 
 
-app.config.setdefault("MODEL", ga.DEFAULT_MODEL)
+# Used when the app is served by gunicorn (Procfile), where main() doesn't run.
+app.config.setdefault("MODEL", os.environ.get("CLAUDE_MODEL", ga.DEFAULT_MODEL))
 
 if __name__ == "__main__":
     main()
