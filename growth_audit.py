@@ -149,6 +149,17 @@ class Progress:
         mins, secs = divmod(int(time.time() - self.audit_start), 60)
         print(f"\nAudit finished in {mins}m {secs}s.", flush=True)
 
+    # Structured hooks. The terminal output above already covers these, so they are no-ops here;
+    # the web UI (app.py) overrides them to stream layer results to the browser.
+    def keywords_chosen(self, keywords: list[str]) -> None:
+        pass
+
+    def layer_started(self, index: int, title: str) -> None:
+        pass
+
+    def layer_finished(self, index: int, title: str, notes: str, ok: bool) -> None:
+        pass
+
 
 class _Spinner:
     def __init__(self, label: str, frames: str):
@@ -454,14 +465,21 @@ def check_llms_txt(base: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Content block types that mark a server-side tool call or its result.
+TOOL_BLOCK_TYPES = {"server_tool_use", "web_search_tool_result", "web_fetch_tool_result"}
+
+
 class Researcher:
     """Thin wrapper around the Messages API with web tools, pause_turn resumption and fallbacks."""
 
-    def __init__(self, model: str):
+    def __init__(self, model: str, on_activity=None):
         self.client = anthropic.Anthropic()
         self.model = model
         self.use_fallback = True
         self.sources: dict[str, str] = {}  # url -> title, gathered from citations and search results
+        # Optional callback(str) told about each search, fetch and writing phase as it streams
+        # (used by the web UI's live log; the CLI leaves it unset).
+        self.on_activity = on_activity
 
     def ask(self, prompt: str, tools: list | None = None, max_tokens: int = 32000) -> str:
         """Run one research request and return the concatenated text of Claude's answer."""
@@ -476,7 +494,13 @@ class Researcher:
                 texts.append("\n\n_(The model declined to complete this part of the audit.)_")
                 break
 
-            texts.extend(b.text for b in response.content if b.type == "text")
+            # Keep only the answer: text written after the last tool call. Earlier text blocks are
+            # running commentary between searches ("Now I'll fetch the pricing page...").
+            tool_positions = [i for i, b in enumerate(response.content) if b.type in TOOL_BLOCK_TYPES]
+            if tool_positions:
+                texts = []
+            start = tool_positions[-1] + 1 if tool_positions else 0
+            texts.extend(b.text for b in response.content[start:] if b.type == "text")
 
             if response.stop_reason == "pause_turn":
                 # The server-side tool loop hit its iteration limit. Send the partial assistant
@@ -504,6 +528,8 @@ class Researcher:
             kwargs["extra_body"] = {"fallbacks": "default"}
         try:
             with self.client.beta.messages.stream(**kwargs) as stream:
+                if self.on_activity:
+                    self._report_activity(stream)
                 return stream.get_final_message()
         except anthropic.BadRequestError as e:
             # Some accounts/models don't accept the fallback beta; disable it and retry once.
@@ -511,6 +537,35 @@ class Researcher:
                 self.use_fallback = False
                 return self._stream(messages, tools, max_tokens)
             raise
+
+    def _report_activity(self, stream) -> None:
+        """Consume stream events, describing each completed tool call to on_activity."""
+        writing = False
+        for event in stream:
+            if event.type == "content_block_start" and event.content_block.type == "text" and not writing:
+                writing = True
+                self.on_activity("Analyzing results and writing findings")
+            if event.type != "content_block_stop":
+                continue
+            block = event.content_block
+            if block.type == "server_tool_use":
+                args = block.input if isinstance(block.input, dict) else {}
+                if block.name == "web_search":
+                    self.on_activity(f'Searching the web: "{args.get("query", "")}"')
+                elif block.name == "web_fetch":
+                    self.on_activity(f"Fetching {args.get('url', 'page')}")
+                writing = False
+            elif block.type == "web_search_tool_result":
+                if isinstance(block.content, list):
+                    self.on_activity(f"  {len(block.content)} results returned")
+                else:
+                    self.on_activity(f"  search failed ({getattr(block.content, 'error_code', 'error')})")
+            elif block.type == "web_fetch_tool_result":
+                content = block.content
+                if getattr(content, "type", "") == "web_fetch_tool_result_error":
+                    self.on_activity(f"  fetch failed ({getattr(content, 'error_code', 'error')})")
+                else:
+                    self.on_activity("  page retrieved")
 
     def _collect_sources(self, response) -> None:
         for block in response.content:
@@ -794,7 +849,13 @@ def synthesize(r: Researcher, ctx: AuditContext, notes: dict[str, str]) -> str:
     )
 
 
-def build_report(ctx: AuditContext, body: str, notes: dict[str, str], sources: dict[str, str]) -> str:
+def build_report(
+    ctx: AuditContext,
+    body: str,
+    notes: dict[str, str],
+    sources: dict[str, str],
+    analyst_notes: dict[str, str] | None = None,
+) -> str:
     comps = ", ".join(ctx.competitors) or "none"
     scope = (
         f"# {ctx.company.title()} Growth Audit\n\n"
@@ -809,6 +870,14 @@ def build_report(ctx: AuditContext, body: str, notes: dict[str, str], sources: d
         "- **Method notes:** Public pages only; no accounts created and no forms submitted. Paid-search "
         "findings are limited to what is publicly observable and are labelled OBSERVED vs INFERRED.\n"
     )
+
+    # Notes the analyst added by hand (web UI), kept separate from the AI research.
+    filled = {t: n.strip() for t, n in (analyst_notes or {}).items() if n and n.strip()}
+    if filled:
+        body = body.rstrip() + "\n\n## 6. Analyst Field Notes\n\n_Live observations added by the analyst, not AI-generated._\n"
+        for title in LAYER_TITLES:
+            if title in filled:
+                body += f"\n### {title}\n\n{filled[title]}\n"
 
     appendix = ["\n---\n\n## Appendix A - Page Fetch Log\n"]
     appendix += [f"- {line}" for line in ctx.fetch_log] or ["- (no pages fetched)"]
@@ -917,6 +986,120 @@ def fetch_all_pages(ctx: AuditContext, progress: Progress) -> None:
         )
 
 
+@dataclass
+class AuditOutcome:
+    """What run_audit() produced. status: complete | partial | out_of_credits."""
+
+    body: str
+    notes: dict[str, str]
+    status: str
+    message: str = ""
+    failed_layers: list[str] = field(default_factory=list)
+
+
+LAYER_FUNCTIONS = [
+    layer1_web_conversion,
+    layer2_paid,
+    layer3_organic_aeo,
+    layer4_lifecycle,
+    layer5_competitive,
+]
+
+
+def run_audit(
+    ctx: AuditContext,
+    researcher: Researcher,
+    progress: Progress,
+    keywords: str = "",
+    resume: bool = False,
+) -> AuditOutcome:
+    """Run the full audit pipeline. Used by both the CLI (main) and the web UI (app.py).
+
+    Raises anthropic.AuthenticationError (bad key) and KeyboardInterrupt; everything else is
+    captured in the returned AuditOutcome so the caller can always write a report.
+    """
+    checkpoint = load_checkpoint(ctx, progress) if resume else {}
+    completed: dict[str, str] = dict(checkpoint.get("completed", {}))
+    researcher.sources.update(checkpoint.get("sources", {}))
+
+    notes: dict[str, str] = {title: "_Not run._" for title in LAYER_TITLES}
+    body = "_Synthesis did not run; see the raw layer notes in Appendix B._\n"
+
+    try:
+        # Step 1: gather page snapshots locally (fast, no API cost).
+        progress.header("Fetching pages (target + competitors)")
+        fetch_all_pages(ctx, progress)
+
+        # Step 2: choose keywords for Layers 2 and 3.
+        progress.header("Choosing high-intent keywords")
+        if keywords:
+            ctx.keywords = [k.strip() for k in keywords.split(",") if k.strip()]
+        elif checkpoint.get("keywords"):
+            ctx.keywords = checkpoint["keywords"]
+            progress.info("Reusing keywords from checkpoint")
+        else:
+            with progress.spin("Generating ICP-specific keywords"):
+                ctx.keywords = generate_keywords(researcher, ctx)
+        for k in ctx.keywords:
+            progress.info(k)
+        progress.keywords_chosen(ctx.keywords)
+
+        # Steps 3-7: the five layers. Each failure is captured and the audit continues;
+        # each success is checkpointed so it never has to be paid for twice.
+        failed: list[str] = []
+        for index, (title, fn) in enumerate(zip(LAYER_TITLES, LAYER_FUNCTIONS), 1):
+            progress.header(title)
+            progress.layer_started(index, title)
+            if title in completed:
+                progress.info("Already complete - reusing notes from checkpoint")
+                notes[title] = completed[title]
+                progress.layer_finished(index, title, notes[title], True)
+                continue
+            notes[title], ok = safe_layer(title, progress, lambda fn=fn: fn(researcher, ctx))
+            progress.layer_finished(index, title, notes[title], ok)
+            if ok:
+                completed[title] = notes[title]
+                save_checkpoint(ctx, completed, researcher.sources)
+            else:
+                failed.append(title)
+
+        # Step 8: synthesize into the final report.
+        progress.header("Writing the audit report")
+        try:
+            with progress.spin("Synthesizing findings"):
+                body = synthesize(researcher, ctx, notes)
+        except anthropic.AuthenticationError:
+            raise
+        except Exception as e:
+            if is_out_of_credits(e):
+                raise OutOfCreditsError(str(e)) from e
+            progress.warn(f"Synthesis failed ({type(e).__name__}: {e}); saving raw layer notes instead")
+            body = "_Synthesis failed; see the raw layer notes in Appendix B._\n"
+            return AuditOutcome(body, notes, "partial", "The final synthesis step failed.", failed)
+    except OutOfCreditsError:
+        save_checkpoint(ctx, completed, researcher.sources)
+        missing = [t for t in LAYER_TITLES if t not in completed]
+        return AuditOutcome(
+            body,
+            notes,
+            "out_of_credits",
+            "your Anthropic account is out of API credit. Completed layers are saved in "
+            f"{checkpoint_path(ctx)}. Add credit in the Claude Console (Plans & Billing), then re-run "
+            "the same command with --resume to finish only what's missing.",
+            missing,
+        )
+    except KeyboardInterrupt:
+        save_checkpoint(ctx, completed, researcher.sources)
+        raise
+
+    # A clean, complete run no longer needs its checkpoint (and a stale one could be resumed by mistake).
+    if not failed and os.path.exists(checkpoint_path(ctx)):
+        os.remove(checkpoint_path(ctx))
+    if failed:
+        return AuditOutcome(body, notes, "partial", f"{len(failed)} layer(s) could not be completed.", failed)
+    return AuditOutcome(body, notes, "complete")
+
+
 def main() -> int:
     load_dotenv()  # reads ANTHROPIC_API_KEY from a .env file in the current directory
     args = parse_args()
@@ -938,89 +1121,22 @@ def main() -> int:
 
     print(f"Growth audit: {url}\nICP: {args.icp}\nCompetitors: {', '.join(competitors) or 'none'}")
 
-    checkpoint = load_checkpoint(ctx, progress) if args.resume else {}
-    completed: dict[str, str] = dict(checkpoint.get("completed", {}))
-    researcher.sources.update(checkpoint.get("sources", {}))
-
-    notes: dict[str, str] = {title: "_Not run._" for title in LAYER_TITLES}
-    body = "_Synthesis did not run; see the raw layer notes in Appendix B._\n"
-    exit_code = 0
-
     try:
-        # Step 1: gather page snapshots locally (fast, no API cost).
-        progress.header("Fetching pages (target + competitors)")
-        fetch_all_pages(ctx, progress)
-
-        # Step 2: choose keywords for Layers 2 and 3.
-        progress.header("Choosing high-intent keywords")
-        if args.keywords:
-            ctx.keywords = [k.strip() for k in args.keywords.split(",") if k.strip()]
-        elif checkpoint.get("keywords"):
-            ctx.keywords = checkpoint["keywords"]
-            progress.info("Reusing keywords from checkpoint")
-        else:
-            with progress.spin("Generating ICP-specific keywords"):
-                ctx.keywords = generate_keywords(researcher, ctx)
-        for k in ctx.keywords:
-            progress.info(k)
-
-        # Steps 3-7: the five layers. Each failure is captured and the audit continues;
-        # each success is checkpointed so it never has to be paid for twice.
-        layers = [
-            layer1_web_conversion,
-            layer2_paid,
-            layer3_organic_aeo,
-            layer4_lifecycle,
-            layer5_competitive,
-        ]
-        for title, fn in zip(LAYER_TITLES, layers):
-            progress.header(title)
-            if title in completed:
-                progress.info("Already complete - reusing notes from checkpoint")
-                notes[title] = completed[title]
-                continue
-            notes[title], ok = safe_layer(title, progress, lambda fn=fn: fn(researcher, ctx))
-            if ok:
-                completed[title] = notes[title]
-                save_checkpoint(ctx, completed, researcher.sources)
-
-        # Step 8: synthesize into the final report.
-        progress.header("Writing the audit report")
-        try:
-            with progress.spin("Synthesizing findings"):
-                body = synthesize(researcher, ctx, notes)
-        except anthropic.AuthenticationError:
-            raise
-        except Exception as e:
-            if is_out_of_credits(e):
-                raise OutOfCreditsError(str(e)) from e
-            progress.warn(f"Synthesis failed ({type(e).__name__}: {e}); saving raw layer notes instead")
-            body = "_Synthesis failed; see the raw layer notes in Appendix B._\n"
-            exit_code = 1
+        outcome = run_audit(ctx, researcher, progress, keywords=args.keywords, resume=args.resume)
     except anthropic.AuthenticationError:
         print("\nError: the Anthropic API rejected the API key. Check ANTHROPIC_API_KEY.", file=sys.stderr)
         return 1
-    except OutOfCreditsError:
-        save_checkpoint(ctx, completed, researcher.sources)
-        print(
-            "\nStopped: your Anthropic account is out of API credit.\n"
-            f"Completed layers are saved in {checkpoint_path(ctx)}. Add credit in the Claude Console "
-            "(Plans & Billing), then re-run the same command with --resume to finish only what's missing.",
-            file=sys.stderr,
-        )
-        exit_code = 2
     except KeyboardInterrupt:
-        save_checkpoint(ctx, completed, researcher.sources)
         print("\nAudit cancelled. Progress saved; re-run with --resume to continue.", file=sys.stderr)
         return 130
+    if outcome.status == "out_of_credits":
+        print(f"\nStopped: {outcome.message}", file=sys.stderr)
+    body, notes = outcome.body, outcome.notes
+    exit_code = {"complete": 0, "out_of_credits": 2}.get(outcome.status, 1)
 
     filename = f"{ctx.company}-growth-audit-{ctx.date}.md"
     with open(filename, "w", encoding="utf-8") as f:
         f.write(build_report(ctx, body, notes, researcher.sources))
-
-    # A clean, complete run no longer needs its checkpoint (and a stale one could be resumed by mistake).
-    if exit_code == 0 and len(completed) == len(LAYER_TITLES) and os.path.exists(checkpoint_path(ctx)):
-        os.remove(checkpoint_path(ctx))
 
     progress.done()
     print(f"Report saved to {os.path.abspath(filename)}")

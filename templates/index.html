@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block title %}New audit · Growth Audit{% endblock %}
+{% block body_class %}page-index{% endblock %}
+{% block content %}
+<div class="index-grid">
+  <section class="hero">
+    <p class="eyebrow"><span class="pulse-dot"></span>Five-layer growth audit</p>
+    <h1 class="hero-title">See the funnel the way <em>your buyer</em> sees it.</h1>
+    <p class="hero-sub">
+      Give it a company, the customer you care about and who they're comparing you with.
+      Claude researches the live site, search results and AI answer engines, then ranks what to fix first.
+    </p>
+    <ol class="layer-list">
+      <li><span class="layer-num">L1</span><span>Web conversion</span><span class="layer-desc">CTAs, friction, time to value</span></li>
+      <li><span class="layer-num">L2</span><span>Paid acquisition</span><span class="layer-desc">Ad presence &amp; message match</span></li>
+      <li><span class="layer-num">L3</span><span>Organic &amp; AEO</span><span class="layer-desc">Rankings, AI answers, llms.txt</span></li>
+      <li><span class="layer-num">L4</span><span>Lifecycle</span><span class="layer-desc">Signup steps &amp; first value</span></li>
+      <li><span class="layer-num">L5</span><span>Competitive</span><span class="layer-desc">Time-to-estimate vs. rivals</span></li>
+    </ol>
+  </section>
+
+  <section class="form-card" aria-labelledby="form-title">
+    <div class="form-card-head">
+      <h2 id="form-title">New audit</h2>
+      <span class="mono-muted">~10–20 min · runs in the background</span>
+    </div>
+
+    {% if not has_key or errors.form %}
+    <div class="alert alert-warn" role="alert">
+      {{ errors.form or "ANTHROPIC_API_KEY is not set. Add it to .env and restart the app to run audits." }}
+    </div>
+    {% endif %}
+
+    <form method="post" action="{{ url_for('start_audit') }}" id="audit-form" novalidate>
+      <div class="field {% if errors.url %}has-error{% endif %}">
+        <label for="url"><span class="field-num">01</span>Company URL</label>
+        <input id="url" name="url" type="text" inputmode="url" autocomplete="url" spellcheck="false"
+               placeholder="https://www.helcim.com" value="{{ form.url or '' }}" required autofocus>
+        {% if errors.url %}<p class="field-error">{{ errors.url }}</p>{% endif %}
+      </div>
+
+      <div class="field {% if errors.icp %}has-error{% endif %}">
+        <label for="icp"><span class="field-num">02</span>Ideal customer profile</label>
+        <input id="icp" name="icp" type="text" autocomplete="off"
+               placeholder="$80K/month dental practice switching from Square" value="{{ form.icp or '' }}" required>
+        {% if errors.icp %}<p class="field-error">{{ errors.icp }}</p>
+        {% else %}<p class="field-hint">Every finding is judged from this buyer's point of view.</p>{% endif %}
+      </div>
+
+      <div class="field {% if errors.competitors %}has-error{% endif %}">
+        <label for="competitors"><span class="field-num">03</span>Competitor URLs <span class="optional">optional</span></label>
+        <input id="competitors" name="competitors" type="text" autocomplete="off" spellcheck="false"
+               placeholder="square.com, stripe.com" value="{{ form.competitors or '' }}">
+        {% if errors.competitors %}<p class="field-error">{{ errors.competitors }}</p>
+        {% else %}<p class="field-hint">Comma-separated.</p>{% endif %}
+      </div>
+
+      <button class="btn-run" type="submit" id="run-btn">
+        <span class="btn-run-label">Run audit</span>
+        <svg class="btn-run-arrow" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h13M13 6l6 6-6 6"/></svg>
+      </button>
+    </form>
+
+    {% if recent %}
+    <div class="recent">
+      <h3 class="section-label">Recent audits</h3>
+      <ul class="recent-list">
+        {% for job in recent %}
+        <li>
+          <a href="{{ url_for('audit_view', audit_id=job.id) }}">
+            <span class="recent-company">{{ job.company|title }}</span>
+            <span class="recent-icp">{{ job.icp }}</span>
+            <span class="status-chip status-{{ job.status }}">{{ job.status.replace('_', ' ') }}</span>
+          </a>
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+  // Show a busy state so a double-click can't start two audits.
+  document.getElementById("audit-form").addEventListener("submit", function () {
+    const btn = document.getElementById("run-btn");
+    btn.disabled = true;
+    btn.classList.add("is-busy");
+    btn.querySelector(".btn-run-label").textContent = "Starting audit…";
+  });
+</script>
+{% endblock %}

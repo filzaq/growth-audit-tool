@@ -1,6 +1,6 @@
 # growth-audit-tool
 
-A reusable command-line tool that runs a structured, five-layer growth audit on any company website through the lens of a specific Ideal Customer Profile (ICP). It compares the company against named competitors and writes the findings to a markdown report.
+A reusable tool, with a command line and a web UI, that runs a structured, five-layer growth audit on any company website through the lens of a specific Ideal Customer Profile (ICP). It compares the company against named competitors and writes the findings to a markdown report.
 
 Research runs on the Anthropic API with the server-side **web search** and **web fetch** tools. Pages are also fetched and parsed locally, which gives Claude the page title, headings, CTAs, form fields and schema markup.
 
@@ -44,7 +44,41 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 Your Anthropic organization must have web search and web fetch enabled in the Claude Console.
 
-## Usage
+## Web UI
+
+```bash
+python app.py
+```
+
+Then open http://127.0.0.1:5000.
+
+![Input form](docs/screenshot-form.png)
+
+1. **Input form:** enter the company URL, the ICP and competitor URLs, then click **Run audit**. The audit runs in a background thread, so the page stays responsive.
+2. **Live progress:** progress streams to the browser over Server-Sent Events, with no page refreshes. The page shows:
+   - a step indicator (prep → L1–L5 → report)
+   - an overall progress bar and elapsed time
+   - a live feed of each search, fetch and analysis step as it happens
+   - a card for each layer, which fills in with that layer's summary when it finishes
+
+   You can reload the page or open it in another tab. It replays everything that has happened so far and then carries on live.
+
+   ![Live progress](docs/screenshot-progress.png)
+
+3. **Results:**
+   - The **Priority Stack** comes first: the top 3 opportunities with impact, confidence and speed shown as meters.
+   - Each layer has a tab. AI research is tagged in teal: what's working, the observations (observed → why it matters → hypothesis) and the full research notes. Your own **field notes** go in the amber panel next to it. They save automatically as you type and are clearly separated from the AI findings.
+   - **Copy markdown** and **Download .md** export the full report. Your field notes are added as an "Analyst Field Notes" section.
+
+   ![Results](docs/screenshot-results.png)
+
+Options: `--port 8080`, `--host 0.0.0.0` (to share on your network), `--model <id>`.
+
+`--load report.md` opens a report you saved earlier in the results view without running a new audit, which is handy for demos. Any field notes in that file are loaded too.
+
+Audit state lives in memory while the server runs. Each finished report is also written to disk with the same filename the CLI uses, so nothing is lost when you stop the server.
+
+## Command line
 
 ```bash
 python growth_audit.py \
